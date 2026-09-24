@@ -29,13 +29,14 @@ sanitize_sensors_output() {
 }
 
 _check_or_install_tool() {
-    local cmd="$1" pkg="$2" description="$3"
+    local cmd="$1" pkg="$2" description="$3" unmet_msg="${4:-$3 is not installed.}"
     if command -v "$cmd" &>/dev/null; then
         info "$description is installed."
         return 0
     fi
+    warn "$unmet_msg"
     local choice
-    choice=$(ask "$description is not installed. Install it now? (y/N)")
+    choice=$(ask "Install $description now, or skip and continue? (y/N)")
     case "$choice" in
         [yY])
             apt-get update -qq
@@ -50,13 +51,88 @@ _check_or_install_tool() {
     esac
 }
 
-_check_nvidia_tool() {
-    if command -v nvidia-smi &>/dev/null; then
-        info "nvidia-smi is installed."
+_check_setcap_available() {
+    command -v setcap &>/dev/null && return 0
+    warn "'setcap' is not installed (needed to grant intel_gpu_top permission to run as www-data)."
+    local choice
+    choice=$(ask "Install libcap2-bin now, or skip and continue? (Y/n)")
+    case "$choice" in
+        [nN])
+            return 1
+            ;;
+        *)
+            apt-get update -qq
+            apt-get install -y libcap2-bin
+            command -v setcap &>/dev/null && return 0 || \
+                { warn "libcap2-bin installation failed; cannot grant CAP_PERFMON."; return 1; }
+            ;;
+    esac
+}
+
+# Quick real-world check: can www-data actually read GPU perf counters via this binary?
+_www_data_can_run_intel_gpu_top() {
+    local bin="$1" out
+    out=$(runuser -u www-data -- timeout 3 "$bin" -J -s 500 -o - 2>&1) || true
+    [[ "$out" != *"Failed to initialize PMU"* && "$out" != *"Permission denied"* ]]
+}
+
+# Verifies (and if needed, requests to grant) the CAP_PERFMON capability that
+# intel_gpu_top needs to run as www-data. Returns 1 if Intel GPU monitoring
+# should stay disabled.
+_verify_intel_gpu_permission() {
+    local bin
+    bin=$(command -v intel_gpu_top) || { warn "intel_gpu_top not found on PATH."; return 1; }
+
+    if _www_data_can_run_intel_gpu_top "$bin"; then
+        info "www-data can already collect Intel GPU performance data."
         return 0
     fi
-    warn "nvidia-smi not found. NVIDIA monitoring requires NVIDIA drivers (not installable via apt)."
-    return 1
+
+    warn "www-data cannot read Intel GPU performance counters (intel_gpu_top requires CAP_PERFMON)."
+    warn "See the Intel GPU 'Security' notes in the node_info readme before proceeding."
+
+    _check_setcap_available || { warn "Skipping Intel GPU monitoring (cannot grant CAP_PERFMON)."; return 1; }
+
+    local choice
+    choice=$(ask "Grant CAP_PERFMON to $bin via setcap, so www-data can collect Intel GPU stats? (Y/n)")
+    case "$choice" in
+        [nN])
+            info "Skipping Intel GPU monitoring (permission not granted)."
+            return 1
+            ;;
+        *)
+            setcap cap_perfmon+ep "$bin"
+            if _www_data_can_run_intel_gpu_top "$bin"; then
+                info "CAP_PERFMON granted; www-data can now collect Intel GPU stats."
+                return 0
+            fi
+            warn "setcap did not resolve the permission problem; disabling Intel GPU monitoring."
+            return 1
+            ;;
+    esac
+}
+
+_check_nvidia_tool() {
+    local description="NVIDIA driver (nvidia-smi)"
+    if command -v nvidia-smi &>/dev/null; then
+        info "$description is installed."
+        return 0
+    fi
+    warn "$description is not installed; NVIDIA GPU information cannot be detected without it."
+    local choice
+    choice=$(ask "Install $description now, or skip and continue? (y/N)")
+    case "$choice" in
+        [yY])
+            apt-get update -qq
+            apt-get install -y nvidia-driver
+            command -v nvidia-smi &>/dev/null && { info "$description installed."; return 0; } || \
+                { warn "$description installation failed (it may also require a reboot to take effect). Section will be skipped."; return 1; }
+            ;;
+        *)
+            info "Skipping $description."
+            return 1
+            ;;
+    esac
 }
 
 # Resolve the PCI vendor ID (lowercase, e.g. "8086") from either a
@@ -240,7 +316,7 @@ node_info_configure() {
         #region RAM
         msgb "\n=== Detecting RAM temperature sensors ==="
         local ramCount
-        ramCount=$(grep -c '"SODIMM[^"]*"' <<<"$sanitisedSensorsOutput" || true)
+        ramCount=$(grep -Ec '"(SODIMM[0-9]*|spd5118-)[^"]*"' <<<"$sanitisedSensorsOutput" || true)
         if [[ "$ramCount" -gt 0 ]]; then
             info "Detected $ramCount RAM sensor(s)."
             ENABLE_RAM_TEMP=1; sensors_detected=true
@@ -339,8 +415,29 @@ node_info_configure() {
         #endregion Temperature unit
     fi
 
+    #region GPU hardware detection
+    msgb "\n=== Detecting GPU hardware ==="
+    local gpuPciInfo="" hasIntelGpu=false hasNvidiaGpu=false hasAmdGpu=false
+    if command -v lspci &>/dev/null; then
+        gpuPciInfo=$(lspci -nn 2>/dev/null | grep -Ei 'VGA compatible controller|3D controller|Display controller' || true)
+        if [[ -n "$gpuPciInfo" ]]; then
+            info "Detected GPU controller(s):"
+            echo "$gpuPciInfo" | while IFS= read -r line; do echo "  $line"; done
+            grep -qi '\[8086:' <<<"$gpuPciInfo" && hasIntelGpu=true
+            grep -qi '\[10de:' <<<"$gpuPciInfo" && hasNvidiaGpu=true
+            grep -qi '\[1002:' <<<"$gpuPciInfo" && hasAmdGpu=true
+        else
+            warn "No VGA/3D/Display GPU controllers found via lspci."
+        fi
+    else
+        warn "lspci not found; cannot detect GPU hardware by vendor. Every GPU vendor will be probed directly instead."
+        hasIntelGpu=true; hasNvidiaGpu=true; hasAmdGpu=true
+    fi
+    #endregion GPU hardware detection
+
     #region Intel GPU
-    msgb "\n=== Detecting Intel GPU ==="
+    msgb "\n=== Intel GPU ==="
+    ENABLE_INTEL_GPU_INFO=0
     local intelCards=""
     if [[ "$DEBUG_INTEL" -eq 1 && -f "$DEBUG_INTEL_FILE" ]]; then
         info "[debug] Using Intel GPU data from $DEBUG_INTEL_FILE"
@@ -357,7 +454,12 @@ node_info_configure() {
         else
             warn "No Intel GPUs in debug file."
         fi
-    elif _check_or_install_tool intel_gpu_top intel-gpu-tools "Intel GPU tools (intel-gpu-tools)"; then
+    elif [[ "$hasIntelGpu" != true ]]; then
+        info "No Intel GPU hardware detected. Skipping."
+    elif ! _check_or_install_tool intel_gpu_top intel-gpu-tools "Intel GPU tools (intel-gpu-tools)" \
+        "intel_gpu_top is not installed; Intel GPU information cannot be detected without it."; then
+        warn "Skipping Intel GPU monitoring."
+    else
         local rawIntelCards
         rawIntelCards=$(intel_gpu_top -L 2>/dev/null | grep -E '^card[0-9]+' || true)
         # Filter out non-Intel devices (e.g. AMD cards misdetected when intel-gpu-tools is installed on non-Intel hardware)
@@ -390,6 +492,8 @@ node_info_configure() {
             json+="]"
             echo "$json" > "$DEBUG_INTEL_FILE"
             info "Intel GPU device list saved to $DEBUG_INTEL_FILE"
+
+            _verify_intel_gpu_permission || ENABLE_INTEL_GPU_INFO=0
         else
             warn "No Intel GPUs detected by intel_gpu_top (or none had an Intel PCI vendor ID)."
         fi
@@ -397,7 +501,8 @@ node_info_configure() {
     #endregion Intel GPU
 
     #region NVIDIA GPU
-    msgb "\n=== Detecting NVIDIA GPU ==="
+    msgb "\n=== NVIDIA GPU ==="
+    ENABLE_NVIDIA_GPU_INFO=0
     if [[ "$DEBUG_NVIDIA" -eq 1 && -f "$DEBUG_NVIDIA_DEVICES_FILE" ]]; then
         info "[debug] Using NVIDIA GPU data from $DEBUG_NVIDIA_DEVICES_FILE"
         local nvidiaCards
@@ -414,7 +519,11 @@ node_info_configure() {
         else
             warn "No NVIDIA GPUs in debug file."
         fi
-    elif _check_nvidia_tool; then
+    elif [[ "$hasNvidiaGpu" != true ]]; then
+        info "No NVIDIA GPU hardware detected. Skipping."
+    elif ! _check_nvidia_tool; then
+        : # already warned/asked inside _check_nvidia_tool
+    else
         local nvidiaCards
         nvidiaCards=$(nvidia-smi -L 2>/dev/null || true)
         if [[ -n "$nvidiaCards" ]]; then
@@ -427,8 +536,28 @@ node_info_configure() {
     fi
     #endregion NVIDIA GPU
 
-    #region AMD GPU (placeholder)
+    #region AMD GPU (disabled — data collection not yet implemented, see Collector/Amd.pm)
     ENABLE_AMD_GPU_INFO=0
+    # msgb "\n=== AMD GPU ==="
+    # if [[ "$DEBUG_AMD" -eq 1 && -f "$DEBUG_AMD_FILE" ]]; then
+    #     info "[debug] Using AMD GPU data from $DEBUG_AMD_FILE"
+    #     local amdCards
+    #     amdCards=$(cat "$DEBUG_AMD_FILE")
+    #     if [[ -n "$amdCards" ]]; then
+    #         info "AMD GPU(s) detected (debug):"
+    #         echo "$amdCards" | while IFS= read -r line; do echo "  $line"; done
+    #         ENABLE_AMD_GPU_INFO=1
+    #     else
+    #         warn "No AMD GPUs in debug file."
+    #     fi
+    # elif [[ "$hasAmdGpu" != true ]]; then
+    #     info "No AMD GPU hardware detected. Skipping."
+    # elif ! _check_or_install_tool rocm-smi rocm-smi "AMD GPU tools (rocm-smi)" \
+    #     "rocm-smi is not installed; AMD GPU information cannot be detected without it."; then
+    #     warn "Skipping AMD GPU monitoring."
+    # else
+    #     warn "AMD GPU hardware and rocm-smi were detected, but AMD GPU data collection is not yet implemented in this pve-mod release."
+    # fi
     #endregion AMD GPU
 
     #region GPU history
