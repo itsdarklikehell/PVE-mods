@@ -1,3 +1,12 @@
+pve-mod (gource.gource.1) stable; urgency=low
+
+  * 4a74e07 fix(node_info): fix js exception when enable rendering of disabled widget (#357)
+  * 9c0e6bb feat(node_info): Add SODIMM temperature support and add DDR5 (spd5118) temperature support (#354)
+  * 7b49946 fix(node_info): verify and manage CAP_PERFMON permission for Intel GPU monitoring (#351)
+  * 015d26d refactor(node_info): unify GPU vendor detection with hardware-first, ask-to-install flow (#347)
+
+ -- github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>  Fri, 25 Sep 2026 16:40:24 +0000
+
 pve-mod (1.0.7) stable; urgency=low
 
   * 8d70194 fix(nag_screen): Patch typo (#318)
