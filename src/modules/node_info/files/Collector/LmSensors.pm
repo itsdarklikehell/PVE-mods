@@ -1,4 +1,4 @@
-﻿package PVE::PVEMod::Collector::LmSensors;
+﻿package PVE::PVEMods::Collector::LmSensors;
 
 use strict;
 use warnings;
@@ -6,8 +6,8 @@ use Exporter 'import';
 
 use JSON;
 
-use PVE::PVEMod::Config qw(%config $process_type $sensors_state_file);
-use PVE::PVEMod::Utils  qw(debug check_executable setup_collector_signals read_sysfs);
+use PVE::PVEMods::Config qw(%config $process_type $sensors_state_file);
+use PVE::PVEMods::Utils  qw(debug check_executable setup_collector_signals read_sysfs);
 
 our @EXPORT_OK = qw(
     collector_for_temperature_sensors
@@ -68,7 +68,7 @@ sub _get_temperature_sensors {
             $sensors_output = '{}';
         }
     } else {
-        $sensors_output = `sensors -j 2>/dev/null | python3 -m json.tool`;
+        $sensors_output = `sensors -J 2>/dev/null | python3 -m json.tool`;
         debug(__LINE__, "Raw lm-sensors output collected from command");
     }
 
@@ -99,12 +99,13 @@ sub _get_temperature_sensors {
         ram   => $config{lm_sensors}{enable_ram_temp}   ? \1 : \0,
         nvme  => $config{lm_sensors}{enable_nvme_temp}  ? \1 : \0,
         fans  => $config{lm_sensors}{enable_fan_speed}  ? \1 : \0,
+        display_zero_speed_fans => $config{lm_sensors}{display_zero_speed_fans} ? \1 : \0,
         hdd   => $config{lm_sensors}{enable_hdd_temp}   ? \1 : \0,
         other => $config{lm_sensors}{enable_other_temp} ? \1 : \0,
         temp_unit => $config{system_info}{temp_unit},
         cpu_temp_target => $config{lm_sensors}{cpu_temp_target},
         ignore_temp_below => $config{system_info}{ignore_temp_below} + 0,
-        data  => { 'PVE MOD lm-sensors Enhanced' => $sensors_json },
+        enhanced_sensors => $sensors_json,
     });
 
     return $data;
@@ -117,6 +118,7 @@ sub _get_temperature_sensors {
 sub _sanitize_sensors {
     my ($sensors_output) = @_;
 
+    $sensors_output =~ s/(?:\\u(?:00b0|fffd)|\xC2\xB0|\xEF\xBF\xBD|\xB0|\x{00B0}|\x{FFFD})([CF])/$1/ig;
     $sensors_output =~ s/ERROR:.+\s(\w+):\s(.+)/\"$1\": 0.000,/g;
     $sensors_output =~ s/ERROR:.+\s(\w+)!/\"$1\": 0.000,/g;
     $sensors_output =~ s/,\s*(})/$1/g;
@@ -133,22 +135,6 @@ sub _sanitize_sensors {
 # Normalize RAM/DIMM temperature entries (DDR5 spd5118 + DDR3/4 SODIMM)
 # into a single "DIMM<slot>" key scheme with a common layout
 # ============================================================================
-
-# Flattens the legacy lm-sensors temperature format into temp1_input/temp1_max/...
-# so the UI can consume a single, common RAM layout.
-sub _flatten_temp_feature {
-    my ($raw) = @_;
-    my %flat;
-    return \%flat unless ref $raw eq 'HASH';
-
-    foreach my $key (keys %$raw) {
-        my $val = $raw->{$key};
-        next unless !ref $val && $key =~ /^temp\d+_(.+)$/;
-        $flat{"temp1_$1"} = $val + 0;
-    }
-
-    return \%flat;
-}
 
 sub _get_ram_info {
     my ($sensors_output) = @_;
@@ -173,7 +159,7 @@ sub _get_ram_info {
         }
 
         $dimms{$slot} = {
-            temp1     => _flatten_temp_feature($sensors_data->{$entry}->{temp1}),
+            temp1     => $sensors_data->{$entry}->{temp1},
             dimm_slot => $slot,
             bus       => $bus + 0,
             address   => $addr,
@@ -182,9 +168,14 @@ sub _get_ram_info {
         delete $sensors_data->{$entry};
     }
 
-    # ----- DDR3/4: SODIMM<N>, flat temp<N>_* fields, no bus/address -----
+    # ----- DDR3/4: SODIMM<N>, retain its structured temperature feature -----
     foreach my $entry (grep { /^SODIMM(\d+)$/ } keys %{$sensors_data}) {
         my ($slot) = ($entry =~ /^SODIMM(\d+)$/);
+        my $entry_data = $sensors_data->{$entry};
+        my ($temp_feature_key) = grep { /^temp\d+$/ } keys %{$entry_data};
+        my $temp_feature = defined($temp_feature_key)
+            ? $entry_data->{$temp_feature_key}
+            : $entry_data;
 
         if (exists $dimms{$slot}) {
             debug(__LINE__, "DIMM slot $slot already assigned; skipping SODIMM entry $entry");
@@ -193,7 +184,7 @@ sub _get_ram_info {
         }
 
         $dimms{$slot} = {
-            temp1     => _flatten_temp_feature($sensors_data->{$entry}),
+            temp1     => $temp_feature,
             dimm_slot => $slot + 0,
             source    => 'jc42',
         };

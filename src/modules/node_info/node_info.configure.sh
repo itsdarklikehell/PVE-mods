@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
-# node_info.configure.sh - Configure module for pve-mod node_info
+# node_info.configure.sh - Configure module for pve-mods node_info
 #
-# Sourced by pve-mod-configure. Requires CONFD_DIR and the helper functions
-# (info, warn, err, ask, msgb) to be defined in the calling script before
-# this file is sourced.
+# Sourced by pve-mods-configure. Requires CONFD_DIR and the helper functions
+# (info, warn, err, ask, msgb, section) to be defined in the calling script
+# before this file is sourced.
 #
 # Provides the standard four-function module API:
 #   node_info_defaults    — set all variables to safe defaults
-#   node_info_load_conf   — parse /etc/pve-mod/conf.d/node_info.conf
+#   node_info_load_conf   — parse /etc/pve-mods/conf.d/node_info.conf
 #   node_info_configure   — interactive hardware-detection wizard
-#   node_info_write_conf  — write /etc/pve-mod/conf.d/node_info.conf
+#   node_info_write_conf  — write /etc/pve-mods/conf.d/node_info.conf
 
 NODE_INFO_CONF="${CONFD_DIR}/node_info.conf"
-KNOWN_CPU_SENSORS=("coretemp-isa-" "k10temp-pci-" "cpu_thermal-virtual-")
 
 # --- utilities ---------------------------------------------------------------
 
@@ -26,6 +25,80 @@ sanitize_sensors_output() {
         s/"SODIMM"\s*:\s*\{\s*"temp(\d+)_input"/"SODIMM $1": {\n  "temp$1_input"/g;
         s/"([^"]*Fan[^"]*)"\s*:\s*\{\s*"fan(\d+)_input"/"$1 $2": {\n  "fan$2_input"/g;
     ' | python3 -m json.tool 2>/dev/null || echo "$input"
+}
+
+detect_sensor_counts() {
+    python3 -c '
+import json, re, sys
+
+data = json.load(sys.stdin)
+cpu_prefixes = ("coretemp-isa-", "k10temp-pci-", "cpu_thermal-virtual-")
+ram_prefixes = ("spd5118-", "jc42-", "SODIMM")
+cpu_sensors = []
+ram_sensors = []
+hdd_sensors = []
+nvme_sensors = []
+other_sensors = []
+fan_sensors = []
+ram_count = hdd_count = nvme_count = other_count = fan_count = 0
+
+def temperature_features(chip):
+    features = []
+    for name, feature in chip.items():
+        if not isinstance(feature, dict):
+            continue
+        reading = feature.get("input")
+        if (isinstance(reading, dict)
+                and reading.get("quantity") == "temperature"
+                and isinstance(reading.get("value"), (int, float))):
+            features.append((name, feature))
+    return features
+
+def joined_names(items):
+    return ",".join(items) or "-"
+
+for chip_name, chip in data.items():
+    if not isinstance(chip, dict):
+        continue
+    temperatures = temperature_features(chip)
+    if temperatures:
+        ram_by_label = any(
+            isinstance(feature.get("label"), str)
+            and re.search(r"(?:SODIMM|DIMM)", feature["label"], re.I)
+            for _, feature in temperatures
+        )
+        if chip_name.startswith(cpu_prefixes):
+            cpu_sensors.append(chip_name)
+        elif chip_name.startswith(ram_prefixes) or ram_by_label:
+            ram_count += 1
+            ram_sensors.append(chip_name)
+        elif chip_name.startswith("drivetemp-scsi-"):
+            hdd_count += 1
+            hdd_sensors.append(chip_name)
+        elif chip_name.startswith(("nvme-pci-", "drivetemp-nvme-")):
+            nvme_count += 1
+            nvme_sensors.append(chip_name)
+        else:
+            other_count += 1
+            other_sensors.append(chip_name)
+
+    for name, feature in chip.items():
+        if not re.fullmatch(r"fan\d+", name) or not isinstance(feature, dict):
+            continue
+        reading = feature.get("input")
+        if (isinstance(reading, dict)
+                and reading.get("quantity") == "speed"
+                and isinstance(reading.get("value"), (int, float))):
+            fan_count += 1
+            fan_sensors.append(f"{chip_name}/{name}")
+
+print("\t".join(map(str, (
+    len(cpu_sensors), ram_count, hdd_count, nvme_count,
+    other_count, fan_count, joined_names(cpu_sensors), joined_names(ram_sensors),
+    joined_names(hdd_sensors), joined_names(nvme_sensors),
+    joined_names(other_sensors), joined_names(fan_sensors)
+))))
+    '
 }
 
 _check_or_install_tool() {
@@ -50,7 +123,6 @@ _check_or_install_tool() {
             ;;
     esac
 }
-
 _check_setcap_available() {
     command -v setcap &>/dev/null && return 0
     warn "'setcap' is not installed (needed to grant intel_gpu_top permission to run as www-data)."
@@ -171,7 +243,7 @@ node_info_defaults() {
                          DEBUG_NVIDIA_DEVICES_FILE="/tmp/nvidia-smi-devices.csv"
     DEBUG_AMD=0;         DEBUG_AMD_FILE="/tmp/amd-gpu-devices.json"
     DEBUG_UPS=0;         DEBUG_UPS_FILE="/tmp/ups-output.json"
-    DEBUG_LOG=0;         DEBUG_LOG_FILE="/tmp/pve-mod-debug.log"
+    DEBUG_LOG=0;         DEBUG_LOG_FILE="/tmp/pve-mods-debug.log"
     DEBUG_MOD=0
 }
 
@@ -251,7 +323,7 @@ node_info_configure() {
         if [[ "$DEBUG_LM_SENSORS" -eq 1 ]]; then
             sensorsOutput=$(cat "$DEBUG_LM_SENSORS_FILE")
         else
-            sensorsOutput=$(sensors -j 2>/dev/null) || true
+            sensorsOutput=$(sensors -J 2>/dev/null) || true
         fi
 
         local trimmedSensorsOutput
@@ -270,22 +342,17 @@ node_info_configure() {
     if [[ "$lm_sensors_ok" == true ]]; then
         local sanitisedSensorsOutput
         sanitisedSensorsOutput=$(sanitize_sensors_output "$sensorsOutput")
+        local sensorCounts cpuCount ramCount hddList nvmeCount otherTempCount fanCount
+        local cpuList ramSensors hddSensors nvmeSensors otherSensors fanSensors
+        sensorCounts=$(printf '%s\n' "$sanitisedSensorsOutput" | detect_sensor_counts 2>/dev/null) \
+            || sensorCounts=$'0\t0\t0\t0\t0\t0\t-\t-\t-\t-\t-\t-'
+        IFS=$'\t' read -r cpuCount ramCount hddList nvmeCount otherTempCount fanCount \
+            cpuList ramSensors hddSensors nvmeSensors otherSensors fanSensors \
+            <<< "$sensorCounts"
 
         #region CPU
-        msgb "\n=== Detecting CPU temperature sensors ==="
-        local cpuList="" cpuCount=0
-        for pattern in "${KNOWN_CPU_SENSORS[@]}"; do
-            local found_cpus
-            found_cpus=$(echo "$sanitisedSensorsOutput" | grep -o "\"${pattern}[^\"]*\"" || true | sed 's/"//g')
-            if [[ -n "$found_cpus" ]]; then
-                while read -r sensor; do
-                    [[ -z "$sensor" ]] && continue
-                    cpuCount=$((cpuCount + 1))
-                    cpuList="${cpuList:+$cpuList,}$sensor"
-                    ENABLE_CPU=1
-                done <<< "$found_cpus"
-            fi
-        done
+        section "Detecting CPU temperature sensors"
+        [[ "$cpuCount" -gt 0 ]] && ENABLE_CPU=1
         if [[ "$ENABLE_CPU" -eq 1 ]]; then
             info "Detected CPU sensors ($cpuCount): $cpuList"
             sensors_detected=true
@@ -314,11 +381,9 @@ node_info_configure() {
         #endregion CPU
 
         #region RAM
-        msgb "\n=== Detecting RAM temperature sensors ==="
-        local ramCount
-        ramCount=$(grep -Ec '"(SODIMM[0-9]*|spd5118-)[^"]*"' <<<"$sanitisedSensorsOutput" || true)
+        section "Detecting RAM temperature sensors"
         if [[ "$ramCount" -gt 0 ]]; then
-            info "Detected $ramCount RAM sensor(s)."
+            info "Detected RAM sensors ($ramCount): $ramSensors"
             ENABLE_RAM_TEMP=1; sensors_detected=true
         else
             warn "No RAM temperature sensors found."
@@ -326,11 +391,9 @@ node_info_configure() {
         #endregion RAM
 
         #region HDD/SSD
-        msgb "\n=== Detecting HDD/SSD temperature sensors ==="
-        local hddList
-        hddList=$(echo "$sanitisedSensorsOutput" | grep -o '"drivetemp-scsi[^"]*"' | sed 's/"//g' | wc -l || true)
+        section "Detecting HDD/SSD temperature sensors"
         if [[ "$hddList" -gt 0 ]]; then
-            info "Detected $hddList HDD/SSD sensor(s)."
+            info "Detected HDD/SSD sensors ($hddList): $hddSensors"
             ENABLE_HDD_TEMP=1; sensors_detected=true
         else
             warn "No HDD/SSD temperature sensors found. (Requires kernel module 'drivetemp'.)"
@@ -338,11 +401,9 @@ node_info_configure() {
         #endregion HDD/SSD
 
         #region NVMe
-        msgb "\n=== Detecting NVMe temperature sensors ==="
-        local nvmeCount
-        nvmeCount=$(echo "$sanitisedSensorsOutput" | grep -c '"nvme[^"]*"' || true)
+        section "Detecting NVMe temperature sensors"
         if [[ "$nvmeCount" -gt 0 ]]; then
-            info "Detected $nvmeCount NVMe sensor(s)."
+            info "Detected NVMe sensors ($nvmeCount): $nvmeSensors"
             ENABLE_NVME_TEMP=1; sensors_detected=true
         else
             warn "No NVMe temperature sensors found."
@@ -350,26 +411,19 @@ node_info_configure() {
         #endregion NVMe
 
         #region Other thermals
-        msgb "\n=== Detecting other thermal sensors ==="
-        local otherTempCount
-        otherTempCount=$(echo "$sanitisedSensorsOutput" \
-            | grep -Ev '"(coretemp|k10temp-pci|cpu_thermal-virtual|nvme|drivetemp-scsi|SODIMM|spd5118)[^"]*"' \
-            | grep -c '"temp[0-9]*_input"' || true)
-
+        section "Detecting other thermal sensors"
         if [[ "$otherTempCount" -gt 0 ]]; then
-            info "Detected $otherTempCount other temperature reading(s)."
+            info "Detected other temperature sensors ($otherTempCount): $otherSensors"
             ENABLE_OTHER_TEMP=1; sensors_detected=true
         else
             warn "No other temperature sensors found."
         fi
-        #region Other thermals
+        #endregion Other thermals
 
         #region Fans
-        msgb "\n=== Detecting fan speed sensors ==="
-        local fanCount
-        fanCount=$(grep -c 'fan[0-9]\+_input' <<<"$sanitisedSensorsOutput" || true)
+        section "Detecting fan speed sensors"
         if [[ "$fanCount" -gt 0 ]]; then
-            info "Detected $fanCount fan speed reading(s)."
+            info "Detected fan speed readings ($fanCount): $fanSensors"
             ENABLE_FAN_SPEED=1; sensors_detected=true
             local choice
             choice=$(ask "Display fans reporting zero speed? (Y/n)")
@@ -384,7 +438,7 @@ node_info_configure() {
 
         #region Temperature unit
         if [[ "$sensors_detected" == true ]]; then
-            msgb "\n=== Temperature unit ==="
+            section "Temperature unit"
             local unit
             unit=$(ask "Display temperatures in Celsius [C] or Fahrenheit [f]? (C/f)")
             case "$unit" in
@@ -392,7 +446,7 @@ node_info_configure() {
                 *)    TEMP_UNIT="C"; info "Using Celsius." ;;
             esac
 
-            msgb "\n=== Ignore threshold ==="
+            section "Ignore threshold"
             local default_c=5 default_display entered
             if [[ "$TEMP_UNIT" == "F" ]]; then
                 default_display=$(awk -v c="$default_c" 'BEGIN{printf "%.0f", c*9/5+32}')
@@ -416,7 +470,7 @@ node_info_configure() {
     fi
 
     #region GPU hardware detection
-    msgb "\n=== Detecting GPU hardware ==="
+    section "Detecting GPU hardware"
     local gpuPciInfo="" hasIntelGpu=false hasNvidiaGpu=false hasAmdGpu=false
     if command -v lspci &>/dev/null; then
         gpuPciInfo=$(lspci -nn 2>/dev/null | grep -Ei 'VGA compatible controller|3D controller|Display controller' || true)
@@ -436,7 +490,7 @@ node_info_configure() {
     #endregion GPU hardware detection
 
     #region Intel GPU
-    msgb "\n=== Intel GPU ==="
+    section "Intel GPU"
     ENABLE_INTEL_GPU_INFO=0
     local intelCards=""
     if [[ "$DEBUG_INTEL" -eq 1 && -f "$DEBUG_INTEL_FILE" ]]; then
@@ -501,7 +555,7 @@ node_info_configure() {
     #endregion Intel GPU
 
     #region NVIDIA GPU
-    msgb "\n=== NVIDIA GPU ==="
+    section "NVIDIA GPU"
     ENABLE_NVIDIA_GPU_INFO=0
     if [[ "$DEBUG_NVIDIA" -eq 1 && -f "$DEBUG_NVIDIA_DEVICES_FILE" ]]; then
         info "[debug] Using NVIDIA GPU data from $DEBUG_NVIDIA_DEVICES_FILE"
@@ -538,7 +592,7 @@ node_info_configure() {
 
     #region AMD GPU (disabled — data collection not yet implemented, see Collector/Amd.pm)
     ENABLE_AMD_GPU_INFO=0
-    # msgb "\n=== AMD GPU ==="
+    # section "AMD GPU"
     # if [[ "$DEBUG_AMD" -eq 1 && -f "$DEBUG_AMD_FILE" ]]; then
     #     info "[debug] Using AMD GPU data from $DEBUG_AMD_FILE"
     #     local amdCards
@@ -556,24 +610,25 @@ node_info_configure() {
     #     "rocm-smi is not installed; AMD GPU information cannot be detected without it."; then
     #     warn "Skipping AMD GPU monitoring."
     # else
-    #     warn "AMD GPU hardware and rocm-smi were detected, but AMD GPU data collection is not yet implemented in this pve-mod release."
+    #     warn "AMD GPU hardware and rocm-smi were detected, but AMD GPU data collection is not yet implemented in this pve-mods release."
     # fi
     #endregion AMD GPU
 
-    #region GPU history
-    if [[ "$ENABLE_INTEL_GPU_INFO" -eq 1 || "$ENABLE_NVIDIA_GPU_INFO" -eq 1 ]]; then
-        msgb "\n=== GPU Historical Data ==="
-        local choice
-        choice=$(ask "Store historical GPU data for graphs? (y/N)")
-        case "$choice" in
-            [yY]) ENABLE_GPU_HISTORY=1; info "Historical GPU data will be stored." ;;
-            *)    info "Historical GPU data disabled." ;;
-        esac
-    fi
+    # GPU historical data and graphs are disabled until the feature is complete.
+    #region GPU history (disabled)
+    # if [[ "$ENABLE_INTEL_GPU_INFO" -eq 1 || "$ENABLE_NVIDIA_GPU_INFO" -eq 1 ]]; then
+    #     section "GPU Historical Data"
+    #     local choice
+    #     choice=$(ask "Store historical GPU data for graphs? (y/N)")
+    #     case "$choice" in
+    #         [yY]) ENABLE_GPU_HISTORY=1; info "Historical GPU data will be stored." ;;
+    #         *)    info "Historical GPU data disabled." ;;
+    #     esac
+    # fi
     #endregion GPU history
 
     #region UPS
-    msgb "\n=== UPS Information ==="
+    section "UPS Information"
     local choiceUPS
     choiceUPS=$(ask "Enable UPS information? (y/N)")
     case "$choiceUPS" in
@@ -608,7 +663,7 @@ node_info_configure() {
     #endregion UPS
 
     #region System info
-    msgb "\n=== System Information ==="
+    section "System Information"
     echo "  type 1) System information (manufacturer, product, serial)"
     dmidecode -t 1 2>/dev/null | awk -F': ' '/Manufacturer|Product Name|Serial Number/ {print "    "$0}' || true
     echo "  type 2) Baseboard/Motherboard information"
@@ -624,7 +679,7 @@ node_info_configure() {
     esac
 
     if [[ "$ENABLE_SYSTEM_INFO" -eq 1 ]]; then
-        local cache_dir="/var/lib/pve-mod"
+        local cache_dir="/var/lib/pve-mods"
         mkdir -p "$cache_dir"
         local cache_file="${cache_dir}/dmidecode-type${SYSTEM_INFO_TYPE}.txt"
         dmidecode -t "$SYSTEM_INFO_TYPE" > "$cache_file" 2>/dev/null || true
@@ -637,8 +692,8 @@ node_info_configure() {
 
 node_info_write_conf() {
     cat > "$NODE_INFO_CONF" <<EOF
-# pve-mod :: node_info mod configuration
-# Managed by pve-mod-configure. Re-run to update.
+# pve-mods :: node_info mod configuration
+# Managed by pve-mods-configure. Re-run to update.
 
 [gpu]
 intel_enabled=${ENABLE_INTEL_GPU_INFO}

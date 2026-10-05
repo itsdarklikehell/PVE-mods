@@ -1,4 +1,4 @@
-﻿package PVE::PVEMod::Collector::Ups;
+﻿package PVE::PVEMods::Collector::Ups;
 
 use strict;
 use warnings;
@@ -6,8 +6,8 @@ use Exporter 'import';
 
 use JSON;
 
-use PVE::PVEMod::Config qw(%config $process_type $ups_state_file);
-use PVE::PVEMod::Utils  qw(debug setup_collector_signals);
+use PVE::PVEMods::Config qw(%config $process_type $ups_state_file);
+use PVE::PVEMods::Utils  qw(debug setup_collector_signals);
 
 our @EXPORT_OK = qw(
     collector_for_ups
@@ -105,8 +105,10 @@ sub _parse_upsc_output {
                 $value =~ s/^\s+|\s+$//g;
 
                 # Coerce numeric values
-                if ($value =~ /^-?\d+\.?\d*$/) {
+                if ($value =~ /^-?\d+\.?\d*$/ && $key ne "ups.serial") {
                     $ups_data->{$key} = $value + 0;
+                } elsif ($key eq "ups.test.result" && $value eq "No test initiated") {
+                    $ups_data->{$key} = "N/A";
                 } else {
                     $ups_data->{$key} = $value;
                 }

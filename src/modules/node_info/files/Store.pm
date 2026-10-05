@@ -1,4 +1,4 @@
-﻿package PVE::PVEMod::Store;
+﻿package PVE::PVEMods::Store;
 
 use strict;
 use warnings;
@@ -8,8 +8,8 @@ use File::Path qw(make_path);
 use PVE::INotify;
 use RRDs;
 
-use PVE::PVEMod::Config qw(%config $RRD_SOCKET $RRD_BASE);
-use PVE::PVEMod::Utils  qw(debug);
+use PVE::PVEMods::Config qw(%config $RRD_SOCKET $RRD_BASE);
+use PVE::PVEMods::Utils  qw(debug);
 
 our @EXPORT_OK = qw(
     get_nodename
@@ -78,6 +78,8 @@ sub _ensure_intel_gpu_rrd {
 
 sub update_intel_gpu_rrd {
     my ($card, $stats) = @_;
+    return unless $config{gpu}{gpu_history};
+
     _ensure_intel_gpu_rrd($card);
     my $path = gpu_rrd_path($card);
 
@@ -144,6 +146,8 @@ sub _ensure_nvidia_gpu_rrd {
 
 sub update_nvidia_gpu_rrd {
     my ($index, $stats) = @_;
+    return unless $config{gpu}{gpu_history};
+
     _ensure_nvidia_gpu_rrd($index);
     my $card = "nvidia$index";
     my $path = gpu_rrd_path($card);

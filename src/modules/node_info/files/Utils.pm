@@ -1,4 +1,4 @@
-﻿package PVE::PVEMod::Utils;
+﻿package PVE::PVEMods::Utils;
 
 use strict;
 use warnings;
@@ -6,10 +6,13 @@ use Exporter 'import';
 
 use JSON;
 use Fcntl qw(O_CREAT O_EXCL O_WRONLY);
+use Sys::Syslog qw(openlog syslog LOG_DEBUG);
 
-use PVE::PVEMod::Config qw($DEBUG_ENABLED $VERSION $pve_mod_working_dir %config);
+use PVE::PVEMods::Config qw($DEBUG_ENABLED $VERSION $pve_mods_working_dir %config);
 
 my $debug_log_fh;
+
+openlog('pve-mods', 'pid', 'user');
 
 our @EXPORT_OK = qw(
     debug
@@ -18,7 +21,7 @@ our @EXPORT_OK = qw(
     get_process_ppid
     read_lock_pid
     acquire_exclusive_lock
-    ensure_pve_mod_directory_exists
+    ensure_pve_mods_directory_exists
     check_executable
     startup_message
     setup_collector_signals
@@ -54,7 +57,7 @@ sub debug {
         $output = "[$sub1:$line] $message\n";
     }
 
-    warn $output;
+    syslog(LOG_DEBUG, '%s', $output);
 
     if ($config{debug}{log_enabled} && !defined $debug_log_fh) {
         if (open(my $fh, '>>', $config{debug}{log_file})) {
@@ -173,16 +176,16 @@ sub acquire_exclusive_lock {
     return $fh;
 }
 
-sub ensure_pve_mod_directory_exists {
-    unless (-d $pve_mod_working_dir) {
-        debug(__LINE__, "Creating directory $pve_mod_working_dir");
-        unless (mkdir($pve_mod_working_dir, 0755)) {
-            debug(__LINE__, "Failed to create $pve_mod_working_dir: $!. PVE Mod cannot start.");
-            die "Failed to create $pve_mod_working_dir: $!";
+sub ensure_pve_mods_directory_exists {
+    unless (-d $pve_mods_working_dir) {
+        debug(__LINE__, "Creating directory $pve_mods_working_dir");
+        unless (mkdir($pve_mods_working_dir, 0755)) {
+            debug(__LINE__, "Failed to create $pve_mods_working_dir: $!. PVE Mod cannot start.");
+            die "Failed to create $pve_mods_working_dir: $!";
         }
-        debug(__LINE__, "Directory $pve_mod_working_dir created");
+        debug(__LINE__, "Directory $pve_mods_working_dir created");
     } else {
-        debug(__LINE__, "Directory $pve_mod_working_dir already exists");
+        debug(__LINE__, "Directory $pve_mods_working_dir already exists");
     }
 }
 

@@ -48,12 +48,12 @@ jobs:
 
           git fetch origin main
 
-          # Collect all commits touching src/ since the last release tag (both paths need this)
+          # Collect all commits touching src/ or debian/ since the last release tag (both paths need this)
           LAST_TAG=$(git describe --tags --abbrev=0 origin/main 2>/dev/null || true)
           if [[ -n "$LAST_TAG" ]]; then
-            LOG=$(git log "${LAST_TAG}..origin/main" --oneline -- src/ | head -50)
+            LOG=$(git log "${LAST_TAG}..origin/main" --oneline -- src/ debian/ ':!debian/changelog' | head -50)
           else
-            LOG=$(git log origin/main --oneline -- src/ | head -50)
+            LOG=$(git log origin/main --oneline -- src/ debian/ ':!debian/changelog' | head -50)
           fi
           if [[ -n "$LOG" ]]; then
             while IFS= read -r line; do
@@ -65,7 +65,7 @@ jobs:
               echo "$line"
             done <<< "$LOG" > /tmp/CHANGES.md
           else
-            echo "No src/ changes since last release." > /tmp/CHANGES.md
+            echo "No src/ or debian/ changes since last release." > /tmp/CHANGES.md
           fi
 
           if [[ "${{ github.event_name }}" == "push" ]]; then
@@ -133,7 +133,7 @@ jobs:
           # Base on main's changelog so reruns always replace the previous bot entry cleanly
           MAIN_CHANGELOG=$(git show origin/main:debian/changelog)
           {
-            echo "pve-mod ($NEW_VERSION) stable; urgency=low"
+            echo "pve-mods ($NEW_VERSION) stable; urgency=low"
             echo ""
             while IFS= read -r line; do
               [[ -n "$line" ]] && echo "  * $line"
@@ -158,7 +158,7 @@ jobs:
             cat /tmp/CHANGES.md 2>/dev/null || echo "No changes recorded."
             echo ""
             echo "---"
-            echo "*Change label to \`bump:minor\` or \`bump:major\` before merging if needed.*"
+            echo "*Use \`bump:major\` for breaking changes, \`bump:minor\` for new features, or \`bump:patch\` for fixes before merging.*"
             echo "*Merge this PR when ready to release.*"
           } > /tmp/pr-body.md
 
