@@ -40,7 +40,14 @@ function update_container() {
 
 for container in $containers; do
   # skip excluded containers
-  if [[ " ${exclude_containers[@]} " =~ " ${container} " ]]; then
+  skip=false
+  for excluded in "${exclude_containers[@]}"; do
+    if [[ "$excluded" == "$container" ]]; then
+      skip=true
+      break
+    fi
+  done
+  if [[ "$skip" == true ]]; then
     echo "[Info] Skipping excluded container, $container"
     echo "[Info] Skipping excluded container, $container" >> $container_main_log_file
     continue
